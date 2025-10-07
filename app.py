@@ -155,217 +155,150 @@ def filter_unlocated_units(units_csv_path, output_csv_name):
     
     return unlocated_df
 
+#Alcohol Product Owners that need to be placed in only Aisle 7
+    #Premier Beverage Consortium
+    #Knobel Spirits LLC
+    #Wise Caldwell Distillers, LLC.
 
+def find_best_location(product_id, product_owner, locations_df, units_df):
+    """
+    Optimized putaway logic with hierarchy:
+    1. Same product
+    2. Same product owner
+    3. General front/back optimization
+    """
 
-def find_best_location(product_id, locations_df, units_df):
-    """
-    Find the best location for a product using these rules:
-    1. Only use East and West zones
-    2. Only use levels containing 'B' (back) or 'F' (front)
-    3. Place near same product if it exists
-    4. Use BACK if front is empty
-    5. Use FRONT if back is full
-    
-    Args:
-        product_id: The Product ID to place
-        locations_df: DataFrame of all warehouse locations
-        units_df: DataFrame of all units (located and unlocated)
-    
-    Returns:
-        dict: Best location info or None if no suitable location found
-    """
-    
-    # Filter to East and West zones only
     valid_zones = ['East', 'West']
     locations_df = locations_df[locations_df['Zone ID'].isin(valid_zones)].copy()
+    locations_df = locations_df[locations_df['Level'].str.contains('B|F', case=False, na=False)]
     
-    # Filter to only levels with 'B' or 'F' in them
-    locations_df = locations_df[
-        locations_df['Level'].str.contains('B|F', case=False, na=False)
-    ].copy()
-    
-    # Filter to only OPEN locations
-    available_locations = locations_df[locations_df['Location Status'] == 'OPEN'].copy()
-    
-    if len(available_locations) == 0:
-        return None
-    
-    # Get all LOCATED units (units with Zone, Aisle, Rack, Level filled)
+    # Get occupied location IDs
     located_units = units_df[
-        (units_df['Zone'].notna()) & (units_df['Zone'] != '') &
-        (units_df['Aisle'].notna()) & (units_df['Aisle'] != '') &
-        (units_df['Rack'].notna()) & (units_df['Rack'] != '') &
-        (units_df['Level'].notna()) & (units_df['Level'] != '')
+        (units_df['Zone'].notna()) & (units_df['Aisle'].notna()) &
+        (units_df['Rack'].notna()) & (units_df['Level'].notna())
     ].copy()
     
-    occupied_location_ids = set(located_units['Location ID'].dropna().astype(str))
-
+    occupied_locations = set()
+    for _, unit in located_units.iterrows():
+        loc_key = f"{unit['Zone']}_{unit['Aisle']}_{unit['Rack']}_{unit['Level']}"
+        occupied_locations.add(loc_key)
+    
+    # Only get OPEN locations that are NOT occupied
+    def is_location_available(row):
+        loc_key = f"{row['Zone ID']}_{row['Aisle']}_{row['Rack']}_{row['Level']}"
+        return loc_key not in occupied_locations
+    
     available_locations = locations_df[
         (locations_df['Location Status'] == 'OPEN') &
-        (~locations_df['Location ID'].astype(str).isin(occupied_location_ids))
+        locations_df.apply(is_location_available, axis=1)
     ].copy()
 
-    if len(available_locations) == 0:
+    if available_locations.empty:
         return None
     
-    # Find where this product currently exists
+
+    # Helper: applies front/back rules to a group of slots
+    def choose_from_group(zone, aisle, rack, group, section_units, reason_prefix):
+        front = group[group['Level'].str.contains('F', case=False, na=False)]
+        back  = group[group['Level'].str.contains('B', case=False, na=False)]
+        front_occupied = not section_units[section_units['Level'].str.contains('F', case=False, na=False)].empty
+        back_occupied  = not section_units[section_units['Level'].str.contains('B', case=False, na=False)].empty
+
+        # Rule 1: both empty → back
+        if not front_occupied and not back_occupied and not back.empty:
+            best = back.iloc[0]
+            return {
+                'Location ID': best['Location ID'],
+                'Zone': best['Zone ID'], 'Aisle': best['Aisle'], 'Rack': best['Rack'], 'Level': best['Level'],
+                'Reason': f'{reason_prefix} - back chosen (both empty)'
+            }
+
+        # Rule 2: front empty + back full → front
+        if not front_occupied and back_occupied and not front.empty:
+            best = front.iloc[0]
+            return {
+                'Location ID': best['Location ID'],
+                'Zone': best['Zone ID'], 'Aisle': best['Aisle'], 'Rack': best['Rack'], 'Level': best['Level'],
+                'Reason': f'{reason_prefix} - front chosen (back full)'
+            }
+
+        # Rule 3: back empty + front full → back
+        if front_occupied and not back_occupied and not back.empty:
+            best = back.iloc[0]
+            return {
+                'Location ID': best['Location ID'],
+                'Zone': best['Zone ID'], 'Aisle': best['Aisle'], 'Rack': best['Rack'], 'Level': best['Level'],
+                'Reason': f'{reason_prefix} - back chosen (front full)'
+            }
+
+        # Default: prefer front if available
+        if not front.empty:
+            best = front.iloc[0]
+            return {
+                'Location ID': best['Location ID'],
+                'Zone': best['Zone ID'], 'Aisle': best['Aisle'], 'Rack': best['Rack'], 'Level': best['Level'],
+                'Reason': f'{reason_prefix} - front (default)'
+            }
+        
+        # Last resort: back
+        if not back.empty:
+            best = back.iloc[0]
+            return {
+                'Location ID': best['Location ID'],
+                'Zone': best['Zone ID'], 'Aisle': best['Aisle'], 'Rack': best['Rack'], 'Level': best['Level'],
+                'Reason': f'{reason_prefix} - back (only option)'
+            }
+        
+        return None
+
+    # --- 1. Try same product
     same_product_units = located_units[located_units['Product ID'] == product_id]
-    
-    if len(same_product_units) == 0:
-        # New product - just pick first available BACK location, then FRONT
-        back_locations = available_locations[
-            available_locations['Level'].str.contains('B', case=False, na=False)
+    if not same_product_units.empty:
+        for _, unit in same_product_units.iterrows():
+            group = available_locations[
+                (available_locations['Zone ID'] == unit['Zone']) &
+                (available_locations['Aisle'] == unit['Aisle']) &
+                (available_locations['Rack'] == unit['Rack'])
+            ]
+            if not group.empty:
+                section_units = located_units[
+                    (located_units['Zone'] == unit['Zone']) &
+                    (located_units['Aisle'] == unit['Aisle']) &
+                    (located_units['Rack'] == unit['Rack'])
+                ]
+                choice = choose_from_group(unit['Zone'], unit['Aisle'], unit['Rack'], group, section_units, "Same product")
+                if choice:
+                    return choice
+
+    # --- 2. Try same product owner (FIX: use correct column name)
+    same_owner_units = located_units[located_units['Product Owner Name'] == product_owner]
+    if not same_owner_units.empty:
+        for _, unit in same_owner_units.iterrows():
+            group = available_locations[
+                (available_locations['Zone ID'] == unit['Zone']) &
+                (available_locations['Aisle'] == unit['Aisle']) &
+                (available_locations['Rack'] == unit['Rack'])
+            ]
+            if not group.empty:
+                section_units = located_units[
+                    (located_units['Zone'] == unit['Zone']) &
+                    (located_units['Aisle'] == unit['Aisle']) &
+                    (located_units['Rack'] == unit['Rack'])
+                ]
+                choice = choose_from_group(unit['Zone'], unit['Aisle'], unit['Rack'], group, section_units, "Same owner")
+                if choice:
+                    return choice
+
+    # --- 3. General warehouse (fallback)
+    aisle_rack_groups = available_locations.groupby(['Zone ID','Aisle','Rack'])
+    for (zone, aisle, rack), group in aisle_rack_groups:
+        section_units = located_units[
+            (located_units['Zone'] == zone) & (located_units['Aisle'] == aisle) & (located_units['Rack'] == rack)
         ]
-        if len(back_locations) > 0:
-            best = back_locations.iloc[0]
-            return {
-                'Location ID': best['Location ID'],
-                'Zone': best['Zone ID'],
-                'Aisle': best['Aisle'],
-                'Rack': best['Rack'],
-                'Level': best['Level'],
-                'Reason': 'New product - back location'
-            }
-        
-        front_locations = available_locations[
-            available_locations['Level'].str.contains('F', case=False, na=False)
-        ]
-        if len(front_locations) > 0:
-            best = front_locations.iloc[0]
-            return {
-                'Location ID': best['Location ID'],
-                'Zone': best['Zone ID'],
-                'Aisle': best['Aisle'],
-                'Rack': best['Rack'],
-                'Level': best['Level'],
-                'Reason': 'New product - front location'
-            }
-        
-        return None
-    
-    # Product exists - find best aisle-rack sections where it lives
-    aisle_rack_combos = same_product_units.groupby(['Zone', 'Aisle', 'Rack']).size().reset_index(name='count')
-    aisle_rack_combos = aisle_rack_combos.sort_values('count', ascending=False)
-    
-    # Try each aisle-rack where product exists
-    for _, ar in aisle_rack_combos.iterrows():
-        zone = ar['Zone']
-        aisle = ar['Aisle']
-        rack = ar['Rack']
-        
-        # Get available locations in this aisle-rack
-        section_available = available_locations[
-            (available_locations['Zone ID'] == zone) &
-            (available_locations['Aisle'] == aisle) &
-            (available_locations['Rack'] == rack)
-        ]
-        
-        if len(section_available) == 0:
-            continue
-        
-        # Get ALL units (occupied) in this aisle-rack section
-        section_occupied = located_units[
-            (located_units['Zone'] == zone) &
-            (located_units['Aisle'] == aisle) &
-            (located_units['Rack'] == rack)
-        ]
-        
-        # Count how many front and back locations are occupied
-        front_occupied = len(section_occupied[
-            section_occupied['Level'].str.contains('F', case=False, na=False)
-        ])
-        
-        back_occupied = len(section_occupied[
-            section_occupied['Level'].str.contains('B', case=False, na=False)
-        ])
-        
-        # Get available front and back locations
-        front_available = section_available[
-            section_available['Level'].str.contains('F', case=False, na=False)
-        ]
-        
-        back_available = section_available[
-            section_available['Level'].str.contains('B', case=False, na=False)
-        ]
-        
-        # Apply logic: back if front empty, front if back full
-        if front_occupied == 0 and len(back_available) > 0:
-            # Front is empty, use back
-            best = back_available.iloc[0]
-            return {
-                'Location ID': best['Location ID'],
-                'Zone': best['Zone ID'],
-                'Aisle': best['Aisle'],
-                'Rack': best['Rack'],
-                'Level': best['Level'],
-                'Reason': f'Back location (front empty in {zone}-{aisle}-{rack})'
-            }
-        
-        elif back_occupied > 0 and len(front_available) > 0:
-            # Back is occupied, use front
-            best = front_available.iloc[0]
-            return {
-                'Location ID': best['Location ID'],
-                'Zone': best['Zone ID'],
-                'Aisle': best['Aisle'],
-                'Rack': best['Rack'],
-                'Level': best['Level'],
-                'Reason': f'Front location (back occupied in {zone}-{aisle}-{rack})'
-            }
-        
-        elif len(front_available) > 0:
-            # Default to front
-            best = front_available.iloc[0]
-            return {
-                'Location ID': best['Location ID'],
-                'Zone': best['Zone ID'],
-                'Aisle': best['Aisle'],
-                'Rack': best['Rack'],
-                'Level': best['Level'],
-                'Reason': f'Front location (default in {zone}-{aisle}-{rack})'
-            }
-        
-        elif len(back_available) > 0:
-            # Only back available
-            best = back_available.iloc[0]
-            return {
-                'Location ID': best['Location ID'],
-                'Zone': best['Zone ID'],
-                'Aisle': best['Aisle'],
-                'Rack': best['Rack'],
-                'Level': best['Level'],
-                'Reason': f'Back location (only option in {zone}-{aisle}-{rack})'
-            }
-    
-    # No locations available in same aisle-rack as product, find any available location
-    back_locations = available_locations[
-        available_locations['Level'].str.contains('B', case=False, na=False)
-    ]
-    if len(back_locations) > 0:
-        best = back_locations.iloc[0]
-        return {
-            'Location ID': best['Location ID'],
-            'Zone': best['Zone ID'],
-            'Aisle': best['Aisle'],
-            'Rack': best['Rack'],
-            'Level': best['Level'],
-            'Reason': 'Fallback - back location (no space near existing product)'
-        }
-    
-    front_locations = available_locations[
-        available_locations['Level'].str.contains('F', case=False, na=False)
-    ]
-    if len(front_locations) > 0:
-        best = front_locations.iloc[0]
-        return {
-            'Location ID': best['Location ID'],
-            'Zone': best['Zone ID'],
-            'Aisle': best['Aisle'],
-            'Rack': best['Rack'],
-            'Level': best['Level'],
-            'Reason': 'Fallback - front location (no space near existing product)'
-        }
-    
+        choice = choose_from_group(zone, aisle, rack, group, section_units, "General")
+        if choice:
+            return choice
+
     return None
 
 
@@ -403,9 +336,11 @@ def move_unlocated_units_fifo(unlocated_units_df, locations_df, units_df, auth_h
         if unit_id.startswith('N'):
             unit_id = unit_id[1:]
         
+        product_owner = row.get('Product Owner Name', '')
         # Find best location using FIFO algorithm
         best_location = find_best_location(
-            product_id, 
+            product_id,
+            product_owner,
             locations_df, 
             units_df
         )
