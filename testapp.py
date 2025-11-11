@@ -90,17 +90,6 @@ def check_token_status(token):
 
 # Move LPN/Unit to location
 def move_unit(unit_id, location_id, auth_header):
-    """
-    Move a unit (LPN) to a specific location
-    
-    Args:
-        unit_id: The Unit ID (without 'N' prefix)
-        location_id: The destination Location ID (not Zone*Aisle*Rack*Level)
-        auth_header: Authorization header with bearer token
-    
-    Returns:
-        bool: True if successful, False otherwise
-    """
     move_url = f"{LOGIN_URL}/api/inventory/lpns/{unit_id}/move"
     params = {"locationId": location_id}
     
@@ -198,7 +187,7 @@ def filter_unlocated_units(units_csv_path, output_csv_name):
     
     return unlocated_df
 
-#Alcohol Product Owners that need to be placed in only Aisle 7
+#Alcohol Product Owners that need to be placed in only West Zone
     #Premier Beverage Consortium
     #Knobel Spirits LLC
     #Wise Caldwell Distillers, LLC.
@@ -211,7 +200,7 @@ def find_best_location(product_id, product_owner, locations_df, units_df):
     3. General front/back optimization
     """
 
-    valid_zones = ['East', 'West']
+    valid_zones = ['Racks']
     locations_df = locations_df[locations_df['Zone ID'].isin(valid_zones)].copy()
     locations_df = locations_df[locations_df['Level'].str.contains('B|F', case=False, na=False)]
     
@@ -248,10 +237,10 @@ def find_best_location(product_id, product_owner, locations_df, units_df):
 
     # Helper: applies front/back rules to a group of slots
     def choose_from_group(zone, aisle, rack, group, section_units, rule_name, priority):
-        front = group[group['Level'].str.contains('F', case=False, na=False)]
-        back  = group[group['Level'].str.contains('B', case=False, na=False)]
-        front_occupied = not section_units[section_units['Level'].str.contains('F', case=False, na=False)].empty
-        back_occupied  = not section_units[section_units['Level'].str.contains('B', case=False, na=False)].empty
+        front = group[group['Level'].str[1] == 'F']
+        back  = group[group['Level'].str[1] == 'B']
+        front_occupied = not section_units[section_units['Level'].str[1] == 'F'].empty
+        back_occupied  = not section_units[section_units['Level'].str[1] == 'B'].empty
 
         fifo_logic = None
 
@@ -267,11 +256,6 @@ def find_best_location(product_id, product_owner, locations_df, units_df):
             fifo_logic = 'BACK_FULL_USE_FRONT'
             confidence = 0.90
 
-        # Rule 3: back empty + front full → back
-        elif front_occupied and not back_occupied and not back.empty:
-            best = back.iloc[0]
-            fifo_logic = 'FRONT_FULL_USE_BACK'
-            confidence = 0.85
 
         # Default: prefer front if available
         elif not front.empty:
@@ -364,18 +348,6 @@ def find_best_location(product_id, product_owner, locations_df, units_df):
 
 
 def move_unlocated_units_fifo(unlocated_units_df, locations_df, units_df, auth_header):
-    """
-    Move all unlocated units to optimal FIFO locations
-    
-    Args:
-        unlocated_units_df: DataFrame of unlocated units
-        locations_df: DataFrame of all warehouse locations
-        units_df: DataFrame of all units
-        auth_header: Authorization header with bearer token
-    
-    Returns:
-        dict: Results summary with success/failure counts
-    """
     results = {
         "success": 0, 
         "failed": 0, 
@@ -406,8 +378,7 @@ def move_unlocated_units_fifo(unlocated_units_df, locations_df, units_df, auth_h
             product_id,
             product_owner,
             locations_df, 
-            units_df,
-            unit_id
+            units_df
         )
 
         log_entry = {
